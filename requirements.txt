@@ -1,4 +1,4 @@
-google-generativeai
+google_generativeai
 langchain
 chromadb
 PyPDF2
