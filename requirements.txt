@@ -1,7 +1,9 @@
+google-generativeai
 langchain
-PyPDF2
 chromadb
-streamlit
-ollama
+PyPDF2
 langchain_community
-langchain_core
+langchain_google_genai
+streamlit
+pydrive
+faiss-cpu
