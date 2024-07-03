@@ -1,214 +1,147 @@
 import streamlit as st
-import logging
 import os
-import tempfile
-import shutil
-import ollama
+import time
+import google.generativeai as genai
 
-import PyPDF2
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_community.chat_models import ChatOllama
-from langchain_core.runnables import RunnablePassthrough
-from langchain.retrievers.multi_query import MultiQueryRetriever
-from typing import List, Tuple, Dict, Any, Optional
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
 
-# Streamlit page configuration
-st.set_page_config(
-    page_title="Ollama PDF RAG Streamlit UI",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains.question_answering import load_qa_chain
+from langchain.prompts import PromptTemplate
 
-# Logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+import pandas as pd
 
-logger = logging.getLogger(__name__)
+load_dotenv()
+os.getenv("GOOGLE_API_KEY")
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 
-@st.cache_resource(show_spinner=True)
-def extract_model_names(
-    models_info: Dict[str, List[Dict[str, Any]]],
-) -> Tuple[str, ...]:
-
-    logger.info("Extracting model names from models_info")
-    model_names = tuple(model["name"] for model in models_info["models"])
-    logger.info(f"Extracted model names: {model_names}")
-    return model_names
-
-
-def create_vector_db(file_upload) -> Chroma:
-
-    logger.info(f"Creating vector DB from file upload: {file_upload.name}")
-    temp_dir = tempfile.mkdtemp()
-
-    path = os.path.join(temp_dir, file_upload.name)
-    with open(path, "wb") as temp_file:
-        temp_file.write(file_upload.getbuffer())
-
-    with open(path, "rb") as file:
-        reader = PyPDF2.PdfReader(file)
-        logger.info(f"File saved to temporary path: {path}")
-        text = ""
-        for page_num in range(len(reader.pages)):
-            page = reader.pages[page_num]
+def get_pdf_text(pdf_docs):
+    text = ""
+    for pdf in pdf_docs:
+        pdf_reader = PdfReader(pdf)
+        for page in pdf_reader.pages:
             text += page.extract_text()
-
-    class Document:
-        def __init__(self, page_content, metadata=None):
-            self.page_content = page_content
-            self.metadata = metadata or {}
-
-    data = [Document(page_content=text)]
-
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=7500, chunk_overlap=100)
-    chunks = text_splitter.split_documents(data)
-    logger.info("Document split into chunks")
-
-    embeddings = OllamaEmbeddings(model="nomic-embed-text", show_progress=True)
-    vector_db = Chroma.from_documents(
-        documents=chunks, embedding=embeddings, collection_name="myRAG"
-    )
-    logger.info("Vector DB created")
-
-    shutil.rmtree(temp_dir)
-    logger.info(f"Temporary directory {temp_dir} removed")
-    return vector_db
+    return text
 
 
-def process_question(question: str, vector_db: Chroma, selected_model: str) -> str:
+def get_text_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+    chunks = text_splitter.split_text(text)
+    return chunks
 
-    logger.info(
-        f"""Processing question: {
-                question} using model: {selected_model}"""
-    )
-    llm = ChatOllama(model=selected_model, temperature=0)
-    QUERY_PROMPT = PromptTemplate(
-        input_variables=["question"],
-        template="""You are an AI language model assistant. Your task is to generate 3
-        different versions of the given user question to retrieve relevant documents from
-        a vector database. By generating multiple perspectives on the user question, your
-        goal is to help the user overcome some of the limitations of the distance-based
-        similarity search. Provide these alternative questions separated by newlines.
-        Original question: {question}""",
-    )
 
-    retriever = MultiQueryRetriever.from_llm(
-        vector_db.as_retriever(), llm, prompt=QUERY_PROMPT
-    )
+def get_vector_store(text_chunks):
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+    vector_store.save_local("faiss_index")
 
-    template = """Answer the question based ONLY on the following context:
-    {context}
-    Question: {question}
-    If you don't know the answer, just say that you don't know, don't try to make up an answer.
-    Only provide the answer from the {context}, nothing else.
-    Add snippets of the context you used to answer the question.
+
+def get_conversational_chain():
+
+    prompt_template = """
+    Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
+    provided context just say, "answer is not available in the context", don't provide the wrong answer\n\n
+    Context:\n {context}?\n
+    Question: \n{question}\n
+
+    Answer:
     """
 
-    prompt = ChatPromptTemplate.from_template(template)
+    model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
 
-    chain = (
-        {"context": retriever, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
+    prompt = PromptTemplate(
+        template=prompt_template, input_variables=["context", "question"]
     )
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
 
-    response = chain.invoke(question)
-    logger.info("Question processed and response generated")
-    return response
+    return chain
 
 
-def delete_vector_db(vector_db: Optional[Chroma]) -> None:
+# Function to store user information in a CSV file
+def store_user_info(name, phone, email):
+    # Check if the file already exists
+    file_path = "user_info.csv"
+    try:
+        df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        # If file doesn't exist, create a new DataFrame
+        df = pd.DataFrame(columns=["Name", "Phone Number", "Email"])
 
-    logger.info("Deleting vector DB")
-    if vector_db is not None:
-        vector_db.delete_collection()
-        st.session_state.pop("file_upload", None)
-        st.session_state.pop("vector_db", None)
-        st.success("Collection and temporary files deleted successfully.")
-        logger.info("Vector DB and related session state cleared")
-        st.rerun()
+    # Append new data to the DataFrame
+    new_data = pd.DataFrame({"Name": [name], "Phone Number": [phone], "Email": [email]})
+    df = pd.concat([df, new_data], ignore_index=True)
+
+    # Write DataFrame back to CSV file
+    df.to_csv(file_path, index=False)
+
+    return file_path
+
+
+def user_input(user_question):
+    if "call me" in user_question.lower():
+        st.write("Sure! Please provide your contact details:")
+        name = st.text_input("Name:")
+        phone = st.text_input("Phone Number:")
+        email = st.text_input("Email:")
+
+        if st.button("Submit"):
+            if name and phone and email:
+                file_path = store_user_info(name, phone, email)
+
+                confirmation_message = st.empty()
+                confirmation_message.write(
+                    f"Thank you, {name}! We will contact you at {phone} or {email}."
+                )
+                time.sleep(5)
+
+                # Rerun the script to refresh the page
+                st.rerun()
+            else:
+                st.warning("Please fill in all fields (Name, Phone Number, Email).")
+
     else:
-        st.error("No vector database found to delete.")
-        logger.warning("Attempted to delete vector DB, but none was found")
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        new_db = FAISS.load_local(
+            "faiss_index", embeddings, allow_dangerous_deserialization=True
+        )
+        docs = new_db.similarity_search(user_question)
 
+        chain = get_conversational_chain()
 
-def main() -> None:
-
-    st.subheader("Ollama RAG PDF Query", divider="gray", anchor=False)
-
-    models_info = ollama.list()
-    available_models = extract_model_names(models_info)
-
-    col1, col2 = st.columns([1.5, 2])
-
-    if "messages" not in st.session_state:
-        st.session_state["messages"] = []
-
-    if "vector_db" not in st.session_state:
-        st.session_state["vector_db"] = None
-
-    if available_models:
-        selected_model = col2.selectbox(
-            "Pick a model available locally on your system ↓", available_models
+        response = chain.invoke(
+            {"input_documents": docs, "question": user_question},
+            return_only_outputs=True,
         )
 
-    file_upload = col1.file_uploader(
-        "Upload a PDF file ↓", type="pdf", accept_multiple_files=False
-    )
+        st.write("Reply: ", response["output_text"])
 
-    if file_upload:
-        st.session_state["file_upload"] = file_upload
-        if st.session_state["vector_db"] is None:
-            st.session_state["vector_db"] = create_vector_db(file_upload)
 
-    delete_collection = col1.button("⚠️ Delete collection", type="secondary")
+def main():
+    st.set_page_config("Chat PDF")
+    st.header("Chat with PDF using Gemini")
 
-    if delete_collection:
-        delete_vector_db(st.session_state["vector_db"])
+    user_question = st.text_input("Ask a Question from the PDF Files")
 
-    with col2:
-        message_container = st.container(height=500, border=True)
+    if user_question:
+        user_input(user_question)
 
-        for message in st.session_state["messages"]:
-            avatar = "🤖" if message["role"] == "assistant" else "😎"
-            with message_container.chat_message(message["role"], avatar=avatar):
-                st.markdown(message["content"])
-
-        if prompt := st.chat_input("Enter a prompt here..."):
-            try:
-                st.session_state["messages"].append({"role": "user", "content": prompt})
-                message_container.chat_message("user", avatar="😎").markdown(prompt)
-
-                with message_container.chat_message("assistant", avatar="🤖"):
-                    with st.spinner(":green[processing...]"):
-                        if st.session_state["vector_db"] is not None:
-                            response = process_question(
-                                prompt, st.session_state["vector_db"], selected_model
-                            )
-                            st.markdown(response)
-                        else:
-                            st.warning("Please upload a PDF file first.")
-
-                if st.session_state["vector_db"] is not None:
-                    st.session_state["messages"].append(
-                        {"role": "assistant", "content": response}
-                    )
-
-            except Exception as e:
-                st.error(e, icon="⛔️")
-                logger.error(f"Error processing prompt: {e}")
-        else:
-            if st.session_state["vector_db"] is None:
-                st.warning("Upload a PDF file to begin chat...")
+    with st.sidebar:
+        st.title("Menu:")
+        pdf_docs = st.file_uploader(
+            "Upload your PDF Files and Click on the Submit & Process Button",
+            accept_multiple_files=True,
+        )
+        if st.button("Submit & Process"):
+            with st.spinner("Processing..."):
+                raw_text = get_pdf_text(pdf_docs)
+                text_chunks = get_text_chunks(raw_text)
+                get_vector_store(text_chunks)
+                st.success("Done")
 
 
 if __name__ == "__main__":
