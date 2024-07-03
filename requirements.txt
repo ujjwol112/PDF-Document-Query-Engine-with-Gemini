@@ -7,3 +7,4 @@ langchain_google_genai
 streamlit
 pydrive
 faiss-cpu
+python-dotenv
