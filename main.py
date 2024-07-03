@@ -16,8 +16,8 @@ from langchain.prompts import PromptTemplate
 import pandas as pd
 
 load_dotenv()
-os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+os.getenv("AIzaSyBWUaLoO2zxNxnziCFucwp3R8RriKgovbw")
+genai.configure(api_key=os.getenv("AIzaSyBWUaLoO2zxNxnziCFucwp3R8RriKgovbw"))
 
 
 def get_pdf_text(pdf_docs):
